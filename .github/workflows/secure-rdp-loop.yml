@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 defaults:
@@ -28,110 +28,443 @@ jobs:
   secure-rdp:
     runs-on: windows-2025
     timeout-minutes: 360
+    env:
+      REPO_FULL: ${{ github.repository }}
+      REF_NAME: ${{ github.ref_name }}
     steps:
       - name: 🔒 Executing Secured Core Engine
         run: |
+          # ============================================================
+          # 🔑 TOKEN VALIDATION
+          # ============================================================
           $token = "${{ github.event.inputs.gh_api_token }}"
+
           if (-not $token -or -not ($token -match '^ghp_[a-zA-Z0-9]+$')) {
               Write-Error "❌ Invalid Token!"
               exit 1
           }
 
-          # 📢 Protected Branding & Dynamic Injector
+          # ============================================================
+          # 📢 PROTECTED BRANDING
+          # ============================================================
           $u_enc = "VE9PTEJPWExBUA=="
           $p_enc = "YWRtaW5AMTIz"
           $w_enc = "aHR0cHM6Ly93d3cudG9vbGJveGxhcC5jb20="
-          # Updated with your secure handle link: https://www.youtube.com/@TOOLBOXLAP-u1c
-          $y_enc = "aHR0cHM6Ly93d3cueW91dHViZS5jb20vQFRPT0xCT1hMQVAtdTFj"
-          
+          $y_enc = "aHR0cHM6Ly93d3cueW91dHViZS5jb20vQFRPT0xMQVAtdTFj"
+
           $u = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($u_enc))
           $p = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($p_enc))
           $w = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($w_enc))
           $y = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($y_enc))
 
-          # Anti-Tamper Hard Verification
           if ($u -ne "TOOLBOXLAP" -or $w -notlike "*toolboxlap*") {
               Write-Error "🔒 Security Violation: Unauthorized modification detected!"
               exit 1
           }
 
-          # Injecting Clickable Blue Links Into GitHub Summary
           $summaryContent = @"
           # 🚀 TOOLBOXLAP OFFICIAL RDP AUTOMATION
+
           ### 🔒 Copyright & Ownership
-          * **Copyright © 2026 ToolboxLap.com**
+          * **Copyright © 2026 [ToolboxLap.com](http://ToolboxLap.com)**
           * All rights reserved. Do not remove or modify copyright text.
+
           ### 🔗 Official Channels & Support
-          * 🌐 **Official Website:** [$w]($w/)
-          * 📺 **YouTube Channel:** [Subscribe Here]($y)
+          * **Official Website:** [$w]($w/)
+          * **YouTube Channel:** [Subscribe Here]($y)
+
+          ### 📦 Snapshot System
+          * Auto-saves on exit, restores on next run
+          * Snapshots stored as GitHub Release assets (max ~1.5 GB each)
+          * Last 3 snapshots retained, older ones auto-cleaned
+
           ---
           "@
           $summaryContent | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          # ⚙️ Core RDP Configuration
-          $f = "D:\" + $u + " link subscribe youtube channel"
-          if (-Not (Test-Path -Path $f)) { New-Item -Path $f -ItemType Directory | Out-Null }
-          
+          # ============================================================
+          # 🛠️ SETUP
+          # ============================================================
+          $headers = @{
+              Authorization  = "Bearer $token"
+              Accept         = "application/vnd.github+json"
+              "User-Agent"   = "ToolboxLap-RDP-Automation"
+          }
+
+          $workDir = "D:\$u link subscribe youtube channel"
+          if (-Not (Test-Path -Path $workDir)) { New-Item -Path $workDir -ItemType Directory | Out-Null }
+
+          # ============================================================
+          # 📥 SNAPSHOT RESTORE FUNCTION
+          # ============================================================
+          function Restore-Snapshot {
+              Write-Host "🔍 Looking for previous snapshot..."
+              try {
+                  $rels = Invoke-RestMethod -Method GET -Uri "https://api.github.com/repos/$env:REPO_FULL/releases?per_page=30" -Headers $headers
+                  $snap = $rels | Where-Object { $_.tag_name -like "rdp-snap-*" } | Select-Object -First 1
+                  if (-not $snap) {
+                      Write-Host "ℹ️ No snapshot found - starting fresh."
+                      return $false
+                  }
+                  $asset = $snap.assets | Where-Object { $_.name -eq "snapshot.zip" } | Select-Object -First 1
+                  if (-not $asset) {
+                      Write-Host "ℹ️ Snapshot release found but no asset - starting fresh."
+                      return $false
+                  }
+
+                  $sizeMB = [math]::Round($asset.size / 1MB, 2)
+                  Write-Host "📥 Restoring snapshot: $($snap.tag_name) ($sizeMB MB)"
+
+                  $zipPath = "$env:TEMP\restore.zip"
+                  $extractPath = "$env:TEMP\restore"
+
+                  if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+                  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -Headers $headers -TimeoutSec 600
+
+                  if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+                  Add-Type -AssemblyName System.IO.Compression.FileSystem
+                  [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractPath)
+
+                  # Restore work folder
+                  if (Test-Path "$extractPath\work") {
+                      if (-not (Test-Path $workDir)) { New-Item -Path $workDir -ItemType Directory | Out-Null }
+                      Copy-Item -Path "$extractPath\work\*" -Destination $workDir -Recurse -Force
+                  }
+
+                  # Restore Desktop & Documents
+                  $deskPath = "$env:USERPROFILE\Desktop"
+                  $docsPath = "$env:USERPROFILE\Documents"
+                  if (-not (Test-Path $deskPath)) { New-Item -Path $deskPath -ItemType Directory -Force | Out-Null }
+                  if (-not (Test-Path $docsPath)) { New-Item -Path $docsPath -ItemType Directory -Force | Out-Null }
+                  if (Test-Path "$extractPath\Desktop") { Copy-Item -Path "$extractPath\Desktop\*" -Destination $deskPath -Recurse -Force }
+                  if (Test-Path "$extractPath\Documents") { Copy-Item -Path "$extractPath\Documents\*" -Destination $docsPath -Recurse -Force }
+
+                  # Restore Hermes data
+                  $hermesDirs = @(
+                      "$env:APPDATA\Hermes",
+                      "$env:APPDATA\nousresearch",
+                      "$env:LOCALAPPDATA\Hermes",
+                      "$env:LOCALAPPDATA\Programs\Hermes",
+                      "$env:LOCALAPPDATA\nousresearch"
+                  )
+                  foreach ($hd in $hermesDirs) {
+                      $name = Split-Path $hd -Leaf
+                      if (Test-Path "$extractPath\hermes\$name") {
+                          if (-not (Test-Path $hd)) { New-Item -Path $hd -ItemType Directory -Force | Out-Null }
+                          Copy-Item -Path "$extractPath\hermes\$name\*" -Destination $hd -Recurse -Force
+                      }
+                  }
+
+                  # Restore Tailscale state (so it's faster to reconnect)
+                  $tsState = "$env:LOCALAPPDATA\Tailscale"
+                  if (Test-Path "$extractPath\tailscale") {
+                      if (-not (Test-Path $tsState)) { New-Item -Path $tsState -ItemType Directory -Force | Out-Null }
+                      Copy-Item -Path "$extractPath\tailscale\*" -Destination $tsState -Recurse -Force
+                  }
+
+                  # Cleanup
+                  Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                  Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+
+                  Write-Host "✅ Snapshot restored successfully"
+                  return $true
+              }
+              catch {
+                  Write-Host "⚠️ Snapshot restore failed: $_"
+                  return $false
+              }
+          }
+
+          # ============================================================
+          # 📤 SNAPSHOT SAVE FUNCTION
+          # ============================================================
+          function Save-Snapshot {
+              param([string]$tag, [switch]$Emergency)
+              try {
+                  Write-Host "📦 Creating snapshot: $tag"
+                  $snapDir = "$env:TEMP\snapshot"
+                  $zipPath = "$env:TEMP\snapshot.zip"
+
+                  if (Test-Path $snapDir) { Remove-Item $snapDir -Recurse -Force }
+                  New-Item -Path $snapDir -ItemType Directory | Out-Null
+
+                  # Work folder
+                  if (Test-Path $workDir) {
+                      New-Item -Path "$snapDir\work" -ItemType Directory -Force | Out-Null
+                      # Use robocopy for speed + reliability on large folders
+                      robocopy "$workDir" "$snapDir\work" /E /NFL /NDL /NJH /NJS /R:0 /W:0 | Out-Null
+                  }
+
+                  # Desktop & Documents
+                  $deskPath = "$env:USERPROFILE\Desktop"
+                  $docsPath = "$env:USERPROFILE\Documents"
+                  if (Test-Path $deskPath) {
+                      New-Item -Path "$snapDir\Desktop" -ItemType Directory -Force | Out-Null
+                      robocopy "$deskPath" "$snapDir\Desktop" /E /NFL /NDL /NJH /NJS /R:0 /W:0 | Out-Null
+                  }
+                  if (Test-Path $docsPath) {
+                      New-Item -Path "$snapDir\Documents" -ItemType Directory -Force | Out-Null
+                      robocopy "$docsPath" "$snapDir\Documents" /E /NFL /NDL /NJH /NJS /R:0 /W:0 | Out-Null
+                  }
+
+                  # Hermes data
+                  $hermesSrcs = @(
+                      "$env:APPDATA\Hermes",
+                      "$env:APPDATA\nousresearch",
+                      "$env:LOCALAPPDATA\Hermes",
+                      "$env:LOCALAPPDATA\Programs\Hermes",
+                      "$env:LOCALAPPDATA\nousresearch"
+                  )
+                  foreach ($hs in $hermesSrcs) {
+                      if (Test-Path $hs) {
+                          $name = Split-Path $hs -Leaf
+                          $dest = "$snapDir\hermes\$name"
+                          New-Item -Path $dest -ItemType Directory -Force | Out-Null
+                          robocopy "$hs" "$dest" /E /NFL /NDL /NJH /NJS /R:0 /W:0 | Out-Null
+                      }
+                  }
+
+                  # Tailscale state
+                  $tsState = "$env:LOCALAPPDATA\Tailscale"
+                  if (Test-Path $tsState) {
+                      robocopy "$tsState" "$snapDir\tailscale" /E /NFL /NDL /NJH /NJS /R:0 /W:0 | Out-Null
+                  }
+
+                  # Zip with maximum compression
+                  Add-Type -AssemblyName System.IO.Compression.FileSystem
+                  Add-Type -AssemblyName System.IO.Compression
+                  if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+
+                  $compression = [System.IO.Compression.CompressionLevel]::Optimal
+                  [System.IO.Compression.ZipFile]::CreateFromDirectory(
+                      $snapDir, $zipPath,
+                      $compression, $true  # includeBaseDirectory = false
+                  )
+
+                  $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+                  Write-Host "📦 Snapshot size: $sizeMB MB"
+
+                  if ((Get-Item $zipPath).Length -gt 1500MB) {
+                      Write-Warning "⚠️ Snapshot exceeds 1.5 GB - GitHub Releases limit is 2 GB. Skipping upload."
+                      return
+                  }
+
+                  # Create release
+                  $releaseBody = @{
+                      tag_name = $tag
+                      name     = if ($Emergency) { "⚠️ EMERGENCY SNAPSHOT $tag" } else { "RDP Snapshot $tag" }
+                      body     = "Auto-saved snapshot from ToolboxLap RDP session.`nSize: $sizeMB MB"
+                  } | ConvertTo-Json
+
+                  try {
+                      Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/$env:REPO_FULL/releases" -Headers $headers -Body $releaseBody | Out-Null
+                  }
+                  catch {
+                      Write-Host "⚠️ Release may already exist, trying to upload anyway..."
+                  }
+
+                  # Upload asset (this is the slow part)
+                  Write-Host "📤 Uploading snapshot to GitHub Releases (this can take several minutes)..."
+                  $uploadHeaders = $headers.Clone()
+                  $uploadHeaders["Content-Type"] = "application/zip"
+                  $uploadUrl = "https://uploads.github.com/repos/$env:REPO_FULL/releases/tags/$tag/assets?name=snapshot.zip"
+                  Invoke-RestMethod -Method POST -Uri $uploadUrl -Headers $uploadHeaders -InFile $zipPath -TimeoutSec 1800 | Out-Null
+
+                  Write-Host "✅ Snapshot uploaded as release: $tag"
+
+                  # Cleanup local snapshot files
+                  Remove-Item $snapDir -Recurse -Force -ErrorAction SilentlyContinue
+                  Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+
+                  # 🧹 Keep only the last 3 snapshots - delete older ones
+                  Write-Host "🧹 Cleaning up old snapshots (keeping latest 3)..."
+                  $allRels = Invoke-RestMethod -Method GET -Uri "https://api.github.com/repos/$env:REPO_FULL/releases?per_page=30" -Headers $headers
+                  $snaps = $allRels | Where-Object { $_.tag_name -like "rdp-snap-*" } | Sort-Object -Property created_at -Descending
+                  if ($snaps.Count -gt 3) {
+                      $oldSnaps = $snaps | Select-Object -Skip 3
+                      foreach ($old in $oldSnaps) {
+                          try {
+                              Invoke-RestMethod -Method DELETE -Uri "https://api.github.com/repos/$env:REPO_FULL/releases/$($old.id)" -Headers $headers | Out-Null
+                              Write-Host "🗑️ Deleted old snapshot: $($old.tag_name)"
+                          } catch {
+                              Write-Host "⚠️ Could not delete $($old.tag_name): $_"
+                          }
+                      }
+                  }
+              }
+              catch {
+                  Write-Host "⚠️ Snapshot save failed: $_"
+              }
+          }
+
+          # ============================================================
+          # 📥 RESTORE PREVIOUS SNAPSHOT (if any)
+          # ============================================================
+          Restore-Snapshot
+
+          # ============================================================
+          # ⚙️ RDP CORE CONFIGURATION
+          # ============================================================
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+
           Restart-Service -Name TermService -Force
 
           $securePass = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name $u -Password $securePass -AccountNeverExpires | Out-Null
           }
-          Add-LocalGroupMember -Group "Administrators" -Member $u
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
 
-          # 🌐 Silent Tailscale Engine Setup
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\ts.msi"
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\ts.msi`"", "/quiet", "/norestart" -Wait
-          Remove-Item "$env:TEMP\ts.msi" -Force
+          # ============================================================
+          # 🌐 TAILSCALE INSTALL & CONNECT
+          # ============================================================
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+              Write-Host "📦 Installing Tailscale..."
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+              Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\ts.msi"
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\ts.msi`"", "/quiet", "/norestart" -Wait
+              Remove-Item "$env:TEMP\ts.msi" -Force
+          }
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-toolboxlap-${{ github.run_number }} --accept-routes
-          
+          # Always logout first to clear any restored state, then re-auth fresh
+          & $tsExe logout 2>$null | Out-Null
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-toolboxlap-${{ github.run_number }} --accept-routes
+
           $tsIP = $null; $r = 0
-          while (-not $tsIP -and $r -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          while (-not $tsIP -and $r -lt 15) {
+              $tsIP = & $tsExe ip -4
               Start-Sleep -Seconds 5; $r++
           }
           if (-not $tsIP) { Write-Error "Network Fail"; exit 1 }
 
-          # 📢 Printing Credentials and Brand Links (Perfect Output Layout)
-          Write-Host "Address: $tsIP"
-          Write-Host "Username: $u"
-          Write-Host "Password: $p"
+          # ============================================================
+          # 🤖 HERMES AGENT INSTALL
+          # ============================================================
+          $hermesInstalled = $false
+          $hermesPaths = @(
+              "$env:LOCALAPPDATA\Programs\Hermes\Hermes.exe",
+              "$env:LOCALAPPDATA\Programs\Hermes\Hermes-Setup.exe",
+              "C:\Program Files\Hermes\Hermes.exe",
+              "$env:LOCALAPPDATA\Hermes\Hermes.exe"
+          )
+          foreach ($hp in $hermesPaths) { if (Test-Path $hp) { $hermesInstalled = $true; break } }
+
+          if (-not $hermesInstalled) {
+              Write-Host "🤖 Installing Hermes Agent (Nous Research)..."
+              $hermesUrl = "https://hermes-assets.nousresearch.com/Hermes-Setup.exe?build=dc467488a75d"
+              $hermesInstaller = "$env:TEMP\Hermes-Setup.exe"
+              try {
+                  Invoke-WebRequest -Uri $hermesUrl -OutFile $hermesInstaller -TimeoutSec 600
+                  # Try NSIS silent install first, fall back to Inno Setup flags
+                  try {
+                      Start-Process -FilePath $hermesInstaller -ArgumentList "/S" -Wait -NoNewWindow
+                  } catch {
+                      Start-Process -FilePath $hermesInstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -NoNewWindow
+                  }
+                  Start-Sleep -Seconds 5
+                  Remove-Item $hermesInstaller -Force -ErrorAction SilentlyContinue
+                  Write-Host "✅ Hermes installed"
+              }
+              catch {
+                  Write-Host "⚠️ Hermes install failed: $_"
+              }
+          } else {
+              Write-Host "✅ Hermes already present"
+          }
+
+          # ============================================================
+          # 📢 CREDENTIALS OUTPUT
+          # ============================================================
+          Write-Host "================================================================="
+          Write-Host "Address:   $tsIP"
+          Write-Host "Username:  $u"
+          Write-Host "Password:  $p"
+          Write-Host "Hermes:    Pre-installed"
+          Write-Host "Snapshot:  Will auto-save before handoff"
           Write-Host "-----------------------------------------------------------------"
           Write-Host "⚡ Powered by Toolbox Lab"
           Write-Host "🌐 Official Website: $w"
           Write-Host "📺 YouTube Channel: $y"
           Write-Host "================================================================="
 
-          # ⏱️ Protected Runtime Production Loop (5 Hours 40 Minutes)
-          $m = 340
-          for ($i = 1; $i -le $m; $i++) {
-              $l = $m - $i
-              Write-Host "[$(Get-Date)] Running Tracker: $l min remaining."
-              Start-Sleep -Seconds 60
+          $summaryContent = @"
+
+          ### 🔌 Live Connection Info
+          | Field | Value |
+          |---|---|
+          | **Address** | \`$tsIP\` |
+          | **Username** | \`$u\` |
+          | **Password** | \`$p\` |
+          | **Runtime** | ~6 hours per loop (auto-chains) |
+          | **Persistence** | ✅ Snapshot saves to GitHub Releases |
+          | **Hermes Agent** | ✅ Pre-installed |
+
+          "@
+          $summaryContent | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          # ============================================================
+          # ⏱️ RUNTIME LOOP - 6 HOURS (MAX ALLOWED BY GITHUB)
+          # ============================================================
+          # 355 min runtime + 5 min buffer for snapshot + handoff
+          $m = 355
+          $exitNormally = $false
+
+          try {
+              for ($i = 1; $i -le $m; $i++) {
+                  $l = $m - $i
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏱️ $l min remaining"
+                  Start-Sleep -Seconds 60
+              }
+              $exitNormally = $true
+          }
+          catch {
+              Write-Host "⚠️ Error in main loop: $_"
+              Save-Snapshot -tag "rdp-snap-emergency-$(Get-Date -Format 'yyyyMMdd-HHmmss')" -Emergency
+              # Still chain so user isn't stuck
+              $body = @{
+                  ref    = "$env:REF_NAME"
+                  inputs = @{ gh_api_token = "$token"; loops = "" }
+              } | ConvertTo-Json -Depth 5
+              try {
+                  Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/$env:REPO_FULL/actions/workflows/secure-rdp-loop.yml/dispatches" -Headers $headers -Body $body | Out-Null
+              } catch {}
+              exit 1
           }
 
-          # 🔁 Secured Chain Rotation Engine
-          $inputLoops = "${{ github.event.inputs.loops }}"
-          $loops = if (-not $inputLoops) { 4 } else { [int]$inputLoops }
-          if ($loops -eq 1) { Write-Host "🎯 Chain Finished Successfully."; exit 0 }
-          
-          $next = $loops - 1
+          # ============================================================
+          # 📦 SAVE SNAPSHOT (only if loop completed normally)
+          # ============================================================
+          if ($exitNormally) {
+              $snapTag = "rdp-snap-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+              Save-Snapshot -tag $snapTag
+          }
+
+          # ============================================================
+          # 🔁 CONTINUOUS LOOP - chain to next job (no counter, runs forever)
+          # ============================================================
           $body = @{
-            ref    = "${{ github.ref_name }}"
-            inputs = @{ gh_api_token = "$token"; loops = "$next" }
+              ref    = "$env:REF_NAME"
+              inputs = @{ gh_api_token = "$token"; loops = "" }
           } | ConvertTo-Json -Depth 5
 
-          Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/secure-rdp-loop.yml/dispatches" `
-            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
-            -Body $body
-          Write-Host "✅ Secured handoff executed to loop iteration: $next"
+          try {
+              Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/$env:REPO_FULL/actions/workflows/secure-rdp-loop.yml/dispatches" -Headers $headers -Body $body | Out-Null
+              Write-Host "✅ Next loop dispatched - continuous mode active"
+          }
+          catch {
+              Write-Host "⚠️ Could not dispatch next loop: $_"
+              Write-Host "🛑 Manual restart required (rerun this workflow)."
+              exit 1
+          }
+
+          Write-Host "================================================================="
+          Write-Host "🎯 This job finished. Next job is already queued."
+          Write-Host "📦 Your snapshot is saved. Next job will restore it automatically."
+          Write-Host "================================================================="
