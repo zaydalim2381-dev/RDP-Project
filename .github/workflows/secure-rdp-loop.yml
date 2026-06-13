@@ -34,4 +34,4 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 🔒 Run RDP automation script
-        run: pwsh -File scripts/secure-rdp.ps1
+         run: pwsh -File ./secure-rdp.ps1
