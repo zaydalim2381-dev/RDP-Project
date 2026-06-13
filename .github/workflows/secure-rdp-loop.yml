@@ -155,6 +155,25 @@ jobs:
                       }
                   }
 
+                  # Restore OpenCode data
+                  $opencodeDirs = @(
+                      "$env:APPDATA\OpenCode",
+                      "$env:APPDATA\opencode",
+                      "$env:LOCALAPPDATA\OpenCode",
+                      "$env:LOCALAPPDATA\opencode",
+                      "$env:LOCALAPPDATA\Programs\OpenCode",
+                      "$env:LOCALAPPDATA\Programs\opencode",
+                      "$env:USERPROFILE\.opencode",
+                      "$env:USERPROFILE\.config\opencode"
+                  )
+                  foreach ($od in $opencodeDirs) {
+                      $name = Split-Path $od -Leaf
+                      if (Test-Path "$extractPath\opencode\$name") {
+                          if (-not (Test-Path $od)) { New-Item -Path $od -ItemType Directory -Force | Out-Null }
+                          Copy-Item -Path "$extractPath\opencode\$name\*" -Destination $od -Recurse -Force
+                      }
+                  }
+
                   # Restore Tailscale state (so it's faster to reconnect)
                   $tsState = "$env:LOCALAPPDATA\Tailscale"
                   if (Test-Path "$extractPath\tailscale") {
@@ -221,6 +240,26 @@ jobs:
                           $dest = "$snapDir\hermes\$name"
                           New-Item -Path $dest -ItemType Directory -Force | Out-Null
                           robocopy "$hs" "$dest" /E /NFL /NDL /NJH /NJS /R:0 /W:0 | Out-Null
+                      }
+                  }
+
+                  # OpenCode data
+                  $opencodeSrcs = @(
+                      "$env:APPDATA\OpenCode",
+                      "$env:APPDATA\opencode",
+                      "$env:LOCALAPPDATA\OpenCode",
+                      "$env:LOCALAPPDATA\opencode",
+                      "$env:LOCALAPPDATA\Programs\OpenCode",
+                      "$env:LOCALAPPDATA\Programs\opencode",
+                      "$env:USERPROFILE\.opencode",
+                      "$env:USERPROFILE\.config\opencode"
+                  )
+                  foreach ($os in $opencodeSrcs) {
+                      if (Test-Path $os) {
+                          $name = Split-Path $os -Leaf
+                          $dest = "$snapDir\opencode\$name"
+                          New-Item -Path $dest -ItemType Directory -Force | Out-Null
+                          robocopy "$os" "$dest" /E /NFL /NDL /NJH /NJS /R:0 /W:0 | Out-Null
                       }
                   }
 
@@ -345,7 +384,141 @@ jobs:
           if (-not $tsIP) { Write-Error "Network Fail"; exit 1 }
 
           # ============================================================
-          # 🤖 HERMES WORKSPACE (clone from GitHub repo)
+          # 📦 PARALLEL APP INSTALLER (downloads + installs concurrently)
+          # ============================================================
+          # Pre-download both installers first (parallel using PowerShell jobs)
+          Write-Host "📥 Pre-downloading installers in parallel..."
+
+          $ocUrl = "https://opencode.ai/download/stable/windows-x64-nsis"
+          $hUrl  = "https://hermes-assets.nousresearch.com/Hermes-Setup.exe?build=0a7a81835b89"
+          $ocInstaller = "$env:TEMP\OpenCode-Setup.exe"
+          $hInstaller  = "$env:TEMP\Hermes-Setup.exe"
+
+          $dlScript = {
+              param($u, $p)
+              try {
+                  Invoke-WebRequest -Uri $u -OutFile $p -UseBasicParsing -TimeoutSec 600
+                  return @{ Ok = $true; Size = (Get-Item $p).Length }
+              } catch {
+                  return @{ Ok = $false; Err = $_.ToString() }
+              }
+          }
+
+          $ocDl = Start-Job -ScriptBlock $dlScript -ArgumentList $ocUrl, $ocInstaller
+          $hDl  = Start-Job -ScriptBlock $dlScript -ArgumentList $hUrl,  $hInstaller
+          $ocRes = Wait-Job $ocDl -Timeout 300 | Receive-Job
+          $hRes  = Wait-Job $hDl  -Timeout 300 | Receive-Job
+          Remove-Job $ocDl, $hDl -Force -ErrorAction SilentlyContinue
+
+          if ($ocRes.Ok) { Write-Host "✅ OpenCode downloaded ($([math]::Round($ocRes.Size/1MB,2)) MB)" }
+          else { Write-Host "❌ OpenCode download failed: $($ocRes.Err)"; $ocInstaller = $null }
+
+          if ($hRes.Ok) { Write-Host "✅ Hermes downloaded ($([math]::Round($hRes.Size/1MB,2)) MB)" }
+          else { Write-Host "❌ Hermes download failed: $($hRes.Err)"; $hInstaller = $null }
+
+          # ============================================================
+          # 🚀 START BOTH INSTALLS IN PARALLEL
+          # ============================================================
+          $ocMarkers = @(
+              "C:\Program Files\OpenCode\opencode.exe",
+              "C:\Program Files (x86)\OpenCode\opencode.exe",
+              "$env:LOCALAPPDATA\Programs\OpenCode\opencode.exe",
+              "$env:LOCALAPPDATA\Programs\opencode\opencode.exe"
+          )
+          $hMarkers = @(
+              "C:\Program Files\Hermes\Hermes.exe",
+              "C:\Program Files (x86)\Hermes\Hermes.exe",
+              "$env:LOCALAPPDATA\Programs\Hermes\Hermes.exe",
+              "$env:LOCALAPPDATA\Hermes\Hermes.exe",
+              "$env:APPDATA\Hermes\Hermes.exe"
+          )
+
+          # Check if already installed (skip)
+          $ocAlready = $false
+          foreach ($m in $ocMarkers) { if (Test-Path $m) { $ocAlready = $true; break } }
+          $hAlready = $false
+          foreach ($m in $hMarkers)  { if (Test-Path $m) { $hAlready  = $true; break } }
+
+          $ocProc = $null
+          $hProc  = $null
+
+          if (-not $ocAlready -and $ocInstaller -and (Test-Path $ocInstaller)) {
+              Write-Host "🚀 Starting OpenCode install in background..."
+              try { $ocProc = Start-Process -FilePath $ocInstaller -ArgumentList "/S" -PassThru -NoNewWindow } catch {}
+          } elseif ($ocAlready) {
+              Write-Host "✅ OpenCode already installed - skipping"
+          }
+
+          if (-not $hAlready -and $hInstaller -and (Test-Path $hInstaller)) {
+              Write-Host "🚀 Starting Hermes install in background (deps may take 15-25 min)..."
+              try { $hProc = Start-Process -FilePath $hInstaller -ArgumentList "/S" -PassThru -NoNewWindow } catch {}
+          } elseif ($hAlready) {
+              Write-Host "✅ Hermes already installed - skipping"
+          }
+
+          # ============================================================
+          # ⏳ WAIT FOR BOTH IN PARALLEL (with separate timeouts)
+          # ============================================================
+          if ($ocProc -or $hProc) {
+              Write-Host "⏳ Waiting for installs to complete in parallel..."
+              $ocDeadline = (Get-Date).AddMinutes(10)
+              $hDeadline  = (Get-Date).AddMinutes(25)
+              $lastLog = Get-Date
+
+              while (($ocProc -and -not $ocProc.HasExited) -or ($hProc -and -not $hProc.HasExited)) {
+                  Start-Sleep -Seconds 5
+
+                  # Per-app timeout enforcement
+                  if ($ocProc -and -not $ocProc.HasExited -and (Get-Date) -gt $ocDeadline) {
+                      Write-Warning "⚠️ OpenCode timed out - killing"
+                      try { Stop-Process -Id $ocProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                      try { taskkill /F /PID $ocProc.Id 2>$null | Out-Null } catch {}
+                      $ocProc = $null
+                  }
+                  if ($hProc -and -not $hProc.HasExited -and (Get-Date) -gt $hDeadline) {
+                      Write-Warning "⚠️ Hermes timed out - killing"
+                      try { Stop-Process -Id $hProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+                      try { taskkill /F /PID $hProc.Id 2>$null | Out-Null } catch {}
+                      $hProc = $null
+                  }
+
+                  # Progress log every 30 sec
+                  if (((Get-Date) - $lastLog).TotalSeconds -ge 30) {
+                      $ocS = if (-not $ocProc) { "✅" } elseif ($ocProc.HasExited) { "✅" } else { "⏳" }
+                      $hS  = if (-not $hProc)  { "✅" } elseif ($hProc.HasExited)  { "✅" } else { "⏳ (deps)" }
+                      Write-Host "[$(Get-Date -Format 'HH:mm:ss')] OpenCode: $ocS  |  Hermes: $hS"
+                      $lastLog = Get-Date
+                  }
+              }
+              Write-Host "✅ Both installs finished"
+          }
+
+          # ============================================================
+          # 🧹 CLEANUP + VERIFY
+          # ============================================================
+          Remove-Item $ocInstaller -Force -ErrorAction SilentlyContinue
+          Remove-Item $hInstaller  -Force -ErrorAction SilentlyContinue
+
+          Start-Sleep -Seconds 3
+          foreach ($pair in @(
+              @{ Name = "OpenCode"; Markers = $ocMarkers; Exe = "opencode.exe" },
+              @{ Name = "Hermes";   Markers = $hMarkers;  Exe = "Hermes.exe" }
+          )) {
+              $ok = $false
+              foreach ($m in $pair.Markers) { if (Test-Path $m) { Write-Host "✅ $($pair.Name) verified: $m"; $ok = $true; break } }
+              if (-not $ok) {
+                  foreach ($root in @("C:\Program Files", "C:\Program Files (x86)", "$env:LOCALAPPDATA\Programs")) {
+                      if (Test-Path $root) {
+                          $found = Get-ChildItem -Path $root -Filter $pair.Exe -Recurse -ErrorAction SilentlyContinue -Depth 4 | Select-Object -First 1
+                          if ($found) { Write-Host "✅ $($pair.Name) found: $($found.FullName)"; $ok = $true; break }
+                      }
+                  }
+              }
+              if (-not $ok) { Write-Warning "⚠️ $($pair.Name) verification failed (may need manual launch)" }
+          }
+
+          # ============================================================
+          # 📂 HERMES WORKSPACE (clone source repo for editing/developing)
           # ============================================================
           $hermesDir = Join-Path $workDir "hermes-workspace"
           $hermesRepo = "outsourc-e/hermes-workspace"
@@ -354,7 +527,6 @@ jobs:
               Write-Host "🔄 Pulling latest updates for hermes-workspace..."
               Push-Location $hermesDir
               try {
-                  # Public clone first, fallback to authenticated if needed
                   git pull --ff-only 2>$null
                   if ($LASTEXITCODE -ne 0) {
                       git -c "credential.helper=" -c "credential.useHttpPath=true" pull "https://$token@github.com/$hermesRepo.git" --ff-only 2>$null
@@ -369,10 +541,8 @@ jobs:
               Write-Host "📥 Cloning hermes-workspace repo..."
               if (Test-Path $hermesDir) { Remove-Item $hermesDir -Recurse -Force }
               try {
-                  # Try public clone first
                   git clone --depth 1 "https://github.com/$hermesRepo.git" $hermesDir 2>$null
                   if ($LASTEXITCODE -ne 0) {
-                      # Fallback to authenticated (private repo)
                       Write-Host "🔐 Public clone failed, trying with auth token..."
                       git clone --depth 1 "https://$token@github.com/$hermesRepo.git" $hermesDir
                   }
@@ -390,7 +560,9 @@ jobs:
           Write-Host "Address:   $tsIP"
           Write-Host "Username:  $u"
           Write-Host "Password:  $p"
-          Write-Host "Hermes:    $hermesDir"
+          Write-Host "OpenCode:  System-installed (preinstalled)"
+          Write-Host "Hermes:    System-installed + workspace cloned"
+          Write-Host "Workspace: $hermesDir"
           Write-Host "Snapshot:  Will auto-save before handoff"
           Write-Host "-----------------------------------------------------------------"
           Write-Host "⚡ Powered by Toolbox Lab"
@@ -406,20 +578,23 @@ jobs:
           | **Address** | \`$tsIP\` |
           | **Username** | \`$u\` |
           | **Password** | \`$p\` |
-          | **Runtime** | ~4h 50m per loop (auto-chains, 20m reserved for snapshot) |
+          | **Runtime** | ~4h 30m per loop (auto-chains, 25m reserved for parallel installs + snapshot) |
           | **Persistence** | ✅ Snapshot saves to GitHub Releases |
-          | **Hermes Workspace** | ✅ Cloned to \`$hermesDir\` |
+          | **OpenCode** | ✅ Pre-installed (parallel install, ~10 min) |
+          | **Hermes App** | ✅ Pre-installed (parallel install, deps ~25 min) |
+          | **Hermes Workspace** | ✅ Source cloned to \`$hermesDir\` |
 
           "@
           $summaryContent | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
           # ============================================================
-          # ⏱️ RUNTIME LOOP - ~4h 50m (leaves 20m for snapshot upload)
+          # ⏱️ RUNTIME LOOP - ~4h 30m (leaves 25m for parallel installs + snapshot)
           # ============================================================
           # Total job cap: 310 min (5h 10m)
-          # Runtime: 290 min (4h 50m)
-          # Snapshot+handoff buffer: 20 min
-          $m = 290
+          # Setup: ~25 min (snapshot restore + parallel installs)
+          # Runtime: 270 min (4h 30m of usable workspace)
+          # Snapshot+handoff buffer: 15 min
+          $m = 270
           $exitNormally = $false
 
           try {
