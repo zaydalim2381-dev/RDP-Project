@@ -27,7 +27,7 @@ defaults:
 jobs:
   secure-rdp:
     runs-on: windows-2025
-    timeout-minutes: 360
+    timeout-minutes: 310
     env:
       REPO_FULL: ${{ github.repository }}
       REF_NAME: ${{ github.ref_name }}
@@ -345,38 +345,42 @@ jobs:
           if (-not $tsIP) { Write-Error "Network Fail"; exit 1 }
 
           # ============================================================
-          # 🤖 HERMES AGENT INSTALL
+          # 🤖 HERMES WORKSPACE (clone from GitHub repo)
           # ============================================================
-          $hermesInstalled = $false
-          $hermesPaths = @(
-              "$env:LOCALAPPDATA\Programs\Hermes\Hermes.exe",
-              "$env:LOCALAPPDATA\Programs\Hermes\Hermes-Setup.exe",
-              "C:\Program Files\Hermes\Hermes.exe",
-              "$env:LOCALAPPDATA\Hermes\Hermes.exe"
-          )
-          foreach ($hp in $hermesPaths) { if (Test-Path $hp) { $hermesInstalled = $true; break } }
+          $hermesDir = Join-Path $workDir "hermes-workspace"
+          $hermesRepo = "outsourc-e/hermes-workspace"
 
-          if (-not $hermesInstalled) {
-              Write-Host "🤖 Installing Hermes Agent (Nous Research)..."
-              $hermesUrl = "https://hermes-assets.nousresearch.com/Hermes-Setup.exe?build=dc467488a75d"
-              $hermesInstaller = "$env:TEMP\Hermes-Setup.exe"
+          if (Test-Path (Join-Path $hermesDir ".git")) {
+              Write-Host "🔄 Pulling latest updates for hermes-workspace..."
+              Push-Location $hermesDir
               try {
-                  Invoke-WebRequest -Uri $hermesUrl -OutFile $hermesInstaller -TimeoutSec 600
-                  # Try NSIS silent install first, fall back to Inno Setup flags
-                  try {
-                      Start-Process -FilePath $hermesInstaller -ArgumentList "/S" -Wait -NoNewWindow
-                  } catch {
-                      Start-Process -FilePath $hermesInstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -NoNewWindow
+                  # Public clone first, fallback to authenticated if needed
+                  git pull --ff-only 2>$null
+                  if ($LASTEXITCODE -ne 0) {
+                      git -c "credential.helper=" -c "credential.useHttpPath=true" pull "https://$token@github.com/$hermesRepo.git" --ff-only 2>$null
                   }
-                  Start-Sleep -Seconds 5
-                  Remove-Item $hermesInstaller -Force -ErrorAction SilentlyContinue
-                  Write-Host "✅ Hermes installed"
+              } catch {
+                  Write-Host "⚠️ git pull failed (will use existing files): $_"
+              }
+              Pop-Location
+              Write-Host "✅ Hermes workspace updated"
+          }
+          else {
+              Write-Host "📥 Cloning hermes-workspace repo..."
+              if (Test-Path $hermesDir) { Remove-Item $hermesDir -Recurse -Force }
+              try {
+                  # Try public clone first
+                  git clone --depth 1 "https://github.com/$hermesRepo.git" $hermesDir 2>$null
+                  if ($LASTEXITCODE -ne 0) {
+                      # Fallback to authenticated (private repo)
+                      Write-Host "🔐 Public clone failed, trying with auth token..."
+                      git clone --depth 1 "https://$token@github.com/$hermesRepo.git" $hermesDir
+                  }
+                  Write-Host "✅ Hermes workspace cloned to: $hermesDir"
               }
               catch {
-                  Write-Host "⚠️ Hermes install failed: $_"
+                  Write-Host "⚠️ Hermes clone failed: $_"
               }
-          } else {
-              Write-Host "✅ Hermes already present"
           }
 
           # ============================================================
@@ -386,7 +390,7 @@ jobs:
           Write-Host "Address:   $tsIP"
           Write-Host "Username:  $u"
           Write-Host "Password:  $p"
-          Write-Host "Hermes:    Pre-installed"
+          Write-Host "Hermes:    $hermesDir"
           Write-Host "Snapshot:  Will auto-save before handoff"
           Write-Host "-----------------------------------------------------------------"
           Write-Host "⚡ Powered by Toolbox Lab"
@@ -402,18 +406,20 @@ jobs:
           | **Address** | \`$tsIP\` |
           | **Username** | \`$u\` |
           | **Password** | \`$p\` |
-          | **Runtime** | ~6 hours per loop (auto-chains) |
+          | **Runtime** | ~4h 50m per loop (auto-chains, 20m reserved for snapshot) |
           | **Persistence** | ✅ Snapshot saves to GitHub Releases |
-          | **Hermes Agent** | ✅ Pre-installed |
+          | **Hermes Workspace** | ✅ Cloned to \`$hermesDir\` |
 
           "@
           $summaryContent | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
           # ============================================================
-          # ⏱️ RUNTIME LOOP - 6 HOURS (MAX ALLOWED BY GITHUB)
+          # ⏱️ RUNTIME LOOP - ~4h 50m (leaves 20m for snapshot upload)
           # ============================================================
-          # 355 min runtime + 5 min buffer for snapshot + handoff
-          $m = 355
+          # Total job cap: 310 min (5h 10m)
+          # Runtime: 290 min (4h 50m)
+          # Snapshot+handoff buffer: 20 min
+          $m = 290
           $exitNormally = $false
 
           try {
@@ -443,7 +449,35 @@ jobs:
           # ============================================================
           if ($exitNormally) {
               $snapTag = "rdp-snap-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-              Save-Snapshot -tag $snapTag
+
+              # Verify snapshot files exist & aren't empty before handoff
+              $hermesDir = Join-Path $workDir "hermes-workspace"
+              Write-Host "🔍 Verifying snapshot contents before upload..."
+              Write-Host "   Work folder: $(if (Test-Path $workDir) { Get-ChildItem $workDir -Recurse -File | Measure-Object | Select-Object -ExpandProperty Count } else { 0 }) files"
+              Write-Host "   Hermes: $(if (Test-Path $hermesDir) { Get-ChildItem $hermesDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count } else { 'NOT FOUND' }) files"
+
+              # Save snapshot (with 3-retry on upload failure)
+              $saved = $false
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  Save-Snapshot -tag $snapTag
+                  # Verify upload succeeded by checking the release exists
+                  try {
+                      $verify = Invoke-RestMethod -Method GET -Uri "https://api.github.com/repos/$env:REPO_FULL/releases/tags/$snapTag" -Headers $headers
+                      if ($verify.assets | Where-Object { $_.name -eq "snapshot.zip" }) {
+                          Write-Host "✅ Snapshot verified on attempt $attempt"
+                          $saved = $true
+                          break
+                      }
+                  } catch {
+                      Write-Host "⚠️ Verification failed (attempt $attempt): $_"
+                      Start-Sleep -Seconds 30
+                  }
+              }
+
+              if (-not $saved) {
+                  Write-Host "🚨 CRITICAL: Snapshot did NOT save after 3 attempts!"
+                  Write-Host "🚨 Next loop will start fresh. Check GitHub releases for partial uploads."
+              }
           }
 
           # ============================================================
